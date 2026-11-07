@@ -145,7 +145,8 @@ def service(pipeline: str, name: str, app: str, launch: str, route: str, path: s
             address = (urls[0] if urls else "").rstrip("/")
         if info["status"] == "in_progress" and address:
             try:
-                r = requests.get(address + health, headers={"Authorization": f"Bearer {check}"}, timeout=20)
+                r = requests.get(address + health, timeout=20,
+                                 headers={"Authorization": f"Bearer {check}", "Accept-Encoding": "identity"})
                 if r.ok:
                     break
                 now = f"{r.status_code} from {health}"
