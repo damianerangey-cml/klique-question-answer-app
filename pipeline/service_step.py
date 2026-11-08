@@ -10,8 +10,9 @@ Running the pipeline again applies it again. For each service step:
   * a changed description: a new instance is started, and once it answers the old one is stopped
   * `state="stopped"`: the running instance is stopped
 
-The description is the app and its launch settings. Its fingerprint is kept on the instance as a tag (`spec:<hash>`),
-next to a tag naming the step (`service:<pipeline>/<step>`), so a later run finds the instance it started.
+The description is the app and its launch settings. Its fingerprint is kept on the instance as a system tag
+(`spec:<hash>`), next to one naming the step (`service:<pipeline>/<step>`), so a later run finds the instance it
+started. System tags, not tags: they are the pipeline's bookkeeping, and people's own tags stay theirs.
 
 Each service gets a route of its own, created once and kept, so its address never changes, not even when the
 instance behind it is replaced. Services that call other services get a router token for exactly the routes they
@@ -91,8 +92,8 @@ def service(pipeline: str, name: str, app: str, launch: str, route: str, path: s
 
     key = f"{pipeline}/{name}"
     running = call("tasks.get_all_ex", {
-        "tags": [f"service:{key}"], "status": ["created", "queued", "in_progress"], "search_hidden": True,
-        "only_fields": ["id", "status", "tags", "name"]}).get("tasks") or []
+        "system_tags": [f"service:{key}"], "status": ["created", "queued", "in_progress"], "search_hidden": True,
+        "only_fields": ["id", "status", "system_tags", "name"]}).get("tasks") or []
 
     if state == "stopped":
         for t in running:
@@ -115,7 +116,7 @@ def service(pipeline: str, name: str, app: str, launch: str, route: str, path: s
                                       "open_to": open_to}, sort_keys=True).encode()).hexdigest()[:12]
 
     the_route = ensure_route()
-    same = [t for t in running if f"spec:{spec}" in (t.get("tags") or [])]
+    same = [t for t in running if f"spec:{spec}" in (t.get("system_tags") or [])]
     older = [t for t in running if t not in same]
 
     if same:
@@ -130,7 +131,9 @@ def service(pipeline: str, name: str, app: str, launch: str, route: str, path: s
                 "env_val": router_token([r.strip() for r in token_routes.split(",") if r.strip()],
                                         f"{key} calls", 30 * 24 * 3600)}]
         instance = call("apps.launch_instance", {"app": app, "launch_params": settings})["instance"]
-        call("tasks.update", {"task": instance, "tags": [f"service:{key}", f"spec:{spec}"]})
+        own = call("tasks.get_all_ex", {"id": [instance], "search_hidden": True,
+                                        "only_fields": ["system_tags"]})["tasks"][0].get("system_tags") or []
+        call("tasks.update", {"task": instance, "system_tags": [*own, f"service:{key}", f"spec:{spec}"]})
         change = "replaced" if older else "started"
         say(f"{change}: launched {instance} with spec {spec}" + (f", replacing {', '.join(t['id'] for t in older)}" if older else ""))
 
