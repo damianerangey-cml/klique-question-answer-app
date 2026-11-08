@@ -28,7 +28,7 @@ class Question(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 def chat_page():
-    return open("/app/chat.html").read()
+    return open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat.html")).read()
 
 
 @app.get("/health")

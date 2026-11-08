@@ -29,13 +29,19 @@ def service(pipeline: str, name: str, app: str, launch: str, route: str, path: s
     """Make sure the service `name` is running as described, and return its address.
 
     pipeline: the pipeline's name, so two pipelines can each have a step of the same name
-    app: the catalogue app that runs the service (for example `containerlaunch`)
-    launch: the app's launch settings, as JSON (what its launch form sends)
+    app: the catalogue app that runs the service (for example `containerlaunch`), or `task` for a task run straight
+        from git
+    launch: the app's launch settings, as JSON (what its launch form sends). For `task`: name, project, queue,
+        repository, branch, commit (or default_commit when commit is empty), entry_point, working_dir, requirements
+        (pip, one per line) and image. The task
+        reads its settings from its Environment section (env, plus ROUTE, PORT and CALLS), gets its own router token
+        for the routes in CALLS, and asks for its address on ROUTE (answer-service/serve.py shows how).
     route, path: the route's name and path under the router. The route is created if it does not exist.
     health: the path that answers 2xx once the service is ready
     env: extra environment variables, one `NAME=value` per line, added to the launch settings'
-        `environment_vars_list`. This is where other steps' outputs come in.
-    token_env, token_routes: put a router token for these routes (comma separated names) into the variable token_env
+        `environment_vars_list` (for `task`: to its Environment section). This is where other steps' outputs come in.
+    token_env, token_routes: put a router token for these routes (comma separated names) into the variable token_env.
+        A `task` gets the route names as CALLS instead and issues its own token.
     open_to: a user group allowed to open the route in a browser (empty: API tokens only)
     state: `running` or `stopped`
     """
@@ -90,6 +96,26 @@ def service(pipeline: str, name: str, app: str, launch: str, route: str, path: s
         return call("auth.generate_endpoint_router_token",
                     {"label": label, "expiration_sec": seconds, "endpoints": ids})["token"]
 
+    def start_task(t: dict, bookkeeping: list[str]) -> str:
+        """Creates the service as a task run straight from git, and enqueues it"""
+        import re
+        found = call("projects.get_all_ex", {"name": f"^{re.escape(t['project'])}$",
+                                             "only_fields": ["id", "name"]}).get("projects") or []
+        project = next((p["id"] for p in found if p["name"] == t["project"]), None) \
+            or call("projects.create", {"name": t["project"]})["id"]
+        created = call("tasks.create", {
+            "name": t["name"], "project": project, "type": "service", "system_tags": bookkeeping,
+            "comment": f"Started by the {pipeline!r} pipeline (step {name}). Run the pipeline again to change it.",
+            "script": {"repository": t["repository"], "branch": t.get("branch", "main"), "version_num": t["commit"],
+                       "entry_point": t["entry_point"], "working_dir": t.get("working_dir", "."), "binary": "python3",
+                       "requirements": {"pip": t.get("requirements", "")}},
+            "container": {"image": t.get("image", "python:3.11-slim")},
+            "hyperparams": {"Environment": {k: {"section": "Environment", "name": k, "value": v}
+                                            for k, v in t["environment"].items()}},
+        })["id"]
+        call("tasks.enqueue", {"task": created, "queue_name": t["queue"]})
+        return created
+
     key = f"{pipeline}/{name}"
     running = call("tasks.get_all_ex", {
         "system_tags": [f"service:{key}"], "status": ["created", "queued", "in_progress"], "search_hidden": True,
@@ -106,11 +132,20 @@ def service(pipeline: str, name: str, app: str, launch: str, route: str, path: s
         return ""
 
     settings = json.loads(launch)
-    settings["route_name"] = route
-    extra = [line.split("=", 1) for line in env.splitlines() if "=" in line]
-    if extra:
-        settings["environment_vars_list"] = [*settings.get("environment_vars_list", []),
-                                             *({"env_key": k.strip(), "env_val": v.strip()} for k, v in extra)]
+    extra = [(k.strip(), v.strip()) for k, v in (line.split("=", 1) for line in env.splitlines() if "=" in line)]
+    if app == "task":
+        # an empty commit means the default (the pipeline's own), settled here so the fingerprint sees the real one
+        settings["commit"] = settings.get("commit") or settings.get("default_commit", "")
+        settings.pop("default_commit", None)
+        if not settings["commit"]:
+            raise RuntimeError(f"{name}: no commit to run")
+        settings["environment"] = {**dict(extra), "ROUTE": route, "PORT": str(settings.get("port", 8080)),
+                                   **({"CALLS": token_routes} if token_routes else {})}
+    else:
+        settings["route_name"] = route
+        if extra:
+            settings["environment_vars_list"] = [*settings.get("environment_vars_list", []),
+                                                 *({"env_key": k, "env_val": v} for k, v in extra)]
     # the fingerprint covers what was asked for, not the token (a new token every run would restart every service)
     spec = hashlib.sha256(json.dumps({"app": app, "launch": settings, "route": route, "path": path,
                                       "open_to": open_to}, sort_keys=True).encode()).hexdigest()[:12]
@@ -125,15 +160,18 @@ def service(pipeline: str, name: str, app: str, launch: str, route: str, path: s
         say(f"unchanged: {instance} already runs spec {spec}")
         change = "unchanged"
     else:
-        if token_env and token_routes:
-            settings["environment_vars_list"] = [*settings.get("environment_vars_list", []), {
-                "env_key": token_env,
-                "env_val": router_token([r.strip() for r in token_routes.split(",") if r.strip()],
-                                        f"{key} calls", 30 * 24 * 3600)}]
-        instance = call("apps.launch_instance", {"app": app, "launch_params": settings})["instance"]
-        own = call("tasks.get_all_ex", {"id": [instance], "search_hidden": True,
-                                        "only_fields": ["system_tags"]})["tasks"][0].get("system_tags") or []
-        call("tasks.update", {"task": instance, "system_tags": [*own, f"service:{key}", f"spec:{spec}"]})
+        if app == "task":
+            instance = start_task(settings, [f"service:{key}", f"spec:{spec}"])
+        else:
+            if token_env and token_routes:
+                settings["environment_vars_list"] = [*settings.get("environment_vars_list", []), {
+                    "env_key": token_env,
+                    "env_val": router_token([r.strip() for r in token_routes.split(",") if r.strip()],
+                                            f"{key} calls", 30 * 24 * 3600)}]
+            instance = call("apps.launch_instance", {"app": app, "launch_params": settings})["instance"]
+            own = call("tasks.get_all_ex", {"id": [instance], "search_hidden": True,
+                                            "only_fields": ["system_tags"]})["tasks"][0].get("system_tags") or []
+            call("tasks.update", {"task": instance, "system_tags": [*own, f"service:{key}", f"spec:{spec}"]})
         change = "replaced" if older else "started"
         say(f"{change}: launched {instance} with spec {spec}" + (f", replacing {', '.join(t['id'] for t in older)}" if older else ""))
 

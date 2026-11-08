@@ -4,7 +4,7 @@ Four service steps and two job steps. The service steps leave their services run
 steps run and finish, as pipeline steps always have:
 
     vector-store ──┐
-    embed-model  ──┼──> answer-service      (service: calls the other three)
+    embed-model  ──┼──> answer-service      (service: calls the other three; a task run straight from this repo)
     chat-model   ──┘
     ingest-docs ─────> load-docs            (job: versions the docs, then loads them into the vector store)
     (load-docs also waits for embed-model and vector-store)
@@ -14,8 +14,12 @@ Running the pipeline applies it: a service whose description has not changed kee
 replaced once its new instance answers, and a service whose state is set to `stopped` is stopped. The addresses travel
 from step to step as step outputs, so no service needs another's address written in by hand.
 
+answer-service is the team's own code, so it runs as a task straight from this repository, by default at the commit
+the pipeline itself runs: one commit describes the whole app, and the service's task page shows its repository,
+branch and commit. The models and the vector store are public images, run by their catalogue apps.
+
 What can be changed from the pipeline's parameters, without touching the code:
-  answer_service_image   the image answer-service runs (its CI tags one per commit: sha-<commit>)
+  answer_service_commit  the commit answer-service runs (empty: the pipeline's own commit)
   chat_model             the chat model (a GGUF file on Hugging Face)
   <service>_state        running or stopped, per service
 
@@ -25,7 +29,7 @@ import glob
 import json
 import os
 
-from clearml import PipelineController
+from clearml import PipelineController, Task
 
 from ingest_pipeline import embed_docs, ingest_docs
 from application_record import application_record
@@ -35,8 +39,6 @@ PIPELINE = "Question and Answer App"
 PROJECT = os.environ.get("PROJECT", "Question and Answer App")
 QUEUE = os.environ.get("QUEUE", "1XCPU")
 DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs")
-IMAGES = "ghcr.io/damianerangey-cml/klique-question-answer-app"
-DEFAULT_IMAGE = f"{IMAGES}/answer-service:sha-b4a19fda88f368276f9d905bb330c5fff10f7c87"
 CHAT_MODEL = "ggml-org/gemma-3-1b-it-GGUF/gemma-3-1b-it-Q4_K_M.gguf"
 EMBED_MODEL = "nomic-ai/nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q4_K_M.gguf"
 
@@ -85,6 +87,20 @@ def container(name: str, image: str, port: int, command: str = "", working_dir: 
     })
 
 
+def own_source() -> tuple[str, str, str]:
+    """The repository, branch and commit this pipeline runs from: the task's own record when it runs as a task, else
+    the clone it runs in"""
+    import subprocess
+    script = Task.current_task().data.script
+    if script and script.repository and script.version_num:
+        return script.repository, script.branch or "main", script.version_num
+    git = lambda *a: subprocess.check_output(["git", *a], cwd=os.path.dirname(os.path.abspath(__file__)), text=True).strip()
+    try:
+        return git("remote", "get-url", "origin"), git("rev-parse", "--abbrev-ref", "HEAD"), git("rev-parse", "HEAD")
+    except (OSError, subprocess.CalledProcessError):
+        raise RuntimeError("run the pipeline from a clone of the repository, or as a task created from it")
+
+
 def address(step: str) -> str:
     return "${" + step + ".parameters.Service/address}"
 
@@ -92,7 +108,9 @@ def address(step: str) -> str:
 if __name__ == "__main__":
     docs = {os.path.basename(p): open(p).read() for p in sorted(glob.glob(os.path.join(DOCS_DIR, "*.md")))}
     pipe = PipelineController(name=PIPELINE, project=PROJECT, version="1.0.0", add_pipeline_tags=False)
-    pipe.add_parameter("answer_service_image", DEFAULT_IMAGE, "the image answer-service runs")
+    # where this pipeline itself runs from: answer-service runs from the same repository
+    repository, branch, own_commit = own_source()
+    pipe.add_parameter("answer_service_commit", "", "the commit answer-service runs (empty: the pipeline's own)")
     pipe.add_parameter("chat_model", CHAT_MODEL, "the chat model")
     pipe.add_parameter("docs_json", json.dumps(docs), "the product docs, from docs/ in the repository")
     for s in ("vector_store", "embed_model", "chat_model", "answer_service"):
@@ -112,14 +130,18 @@ if __name__ == "__main__":
                  launch=llama("embed-model", EMBED_MODEL, "embed", embedding=True))
     service_step("chat_model", app="llama-cpp-model-deployment", health="/chat/v1/models",
                  launch=llama("chat-model", "${pipeline.chat_model}", "chat"))
+    requirements = open(os.path.join(os.path.dirname(DOCS_DIR), "answer-service", "requirements.txt")).read()
     service_step("answer_service", parents=["vector_store", "embed_model", "chat_model"],
-                 app="containerlaunch", health="/", open_to="Users",
-                 launch=container("answer-service", "${pipeline.answer_service_image}", 8080,
-                                  "uvicorn app:app --host 0.0.0.0 --port 8080 --app-dir /app"),
+                 app="task", health="/health", open_to="Users",
+                 launch=json.dumps({
+                     "name": "answer-service", "project": PROJECT, "queue": QUEUE, "image": "python:3.11-slim",
+                     "repository": repository, "branch": branch, "commit": "${pipeline.answer_service_commit}",
+                     "entry_point": "serve.py", "working_dir": "answer-service", "port": 8080,
+                     "default_commit": own_commit, "requirements": requirements.strip() + "\nclearml"}),
                  env="\n".join([f"CHAT_URL={address('chat_model')}/chat",
                                 f"EMBED_URL={address('embed_model')}/embed",
                                 f"VECTOR_URL={address('vector_store')}"]),
-                 token_env="ROUTER_TOKEN", token_routes="qa-chat-model,qa-embed-model,qa-vector-store")
+                 token_routes="qa-chat-model,qa-embed-model,qa-vector-store")
 
     pipe.add_function_step(name="ingest_docs", function=ingest_docs, function_kwargs=dict(docs_json="${pipeline.docs_json}"),
                            function_return=["dataset_id"], cache_executed_step=False)
