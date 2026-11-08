@@ -98,7 +98,10 @@ def service(pipeline: str, name: str, app: str, launch: str, route: str, path: s
         for t in running:
             call("tasks.stop", {"task": t["id"], "force": True})
             say(f"stopped {t['id']}")
-        task.set_parameter("Service/state", "stopped")
+        # later steps reference these, so they are set (empty) for a stopped service too
+        task.set_parameter("Service/address", "")
+        task.set_parameter("Service/instance", "")
+        task.set_parameter("Service/change", "stopped" if running else "unchanged")
         return ""
 
     settings = json.loads(launch)

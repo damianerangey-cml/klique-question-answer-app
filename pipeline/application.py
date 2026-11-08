@@ -8,6 +8,7 @@ steps run and finish, as pipeline steps always have:
     chat-model   ──┘
     ingest-docs ─────> load-docs            (job: versions the docs, then loads them into the vector store)
     (load-docs also waits for embed-model and vector-store)
+    all four services ──> application-record (job: groups them as one application in Project > Services)
 
 Running the pipeline applies it: a service whose description has not changed keeps running untouched, a changed one is
 replaced once its new instance answers, and a service whose state is set to `stopped` is stopped. The addresses travel
@@ -27,6 +28,7 @@ import os
 from clearml import PipelineController
 
 from ingest_pipeline import embed_docs, ingest_docs
+from application_record import application_record
 from service_step import service
 
 PIPELINE = "Question and Answer App"
@@ -126,4 +128,12 @@ if __name__ == "__main__":
                            function_kwargs=dict(dataset_id="${ingest_docs.dataset_id}", embed_url=address("embed_model") + "/embed",
                                                 vector_url=address("vector_store"), routes="qa-embed-model,qa-vector-store"),
                            function_return=["points"])
+    steps = ("vector_store", "embed_model", "chat_model", "answer_service")
+    pipe.add_function_step(name="application_record", function=application_record, parents=list(steps),
+                           cache_executed_step=False, function_return=["record"],
+                           function_kwargs=dict(project=PROJECT, application=PIPELINE,
+                                                members="\n".join(f"{s.replace('_', '-')}=${{{s}.parameters.Service/instance}}"
+                                                                   for s in steps),
+                                                connections="\n".join(f"answer-service>{s}" for s in
+                                                                       ("chat-model", "embed-model", "vector-store"))))
     pipe.start_locally(run_pipeline_steps_locally=True)
