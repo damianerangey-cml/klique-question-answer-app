@@ -70,12 +70,24 @@ def service(pipeline: str, name: str, app: str, launch: str, route: str, path: s
         found = call("routers.get_routes", {"name": f"^{route_name}$"}).get("routes") or []
         return next((r for r in found if r.get("name") == route_name), None)
 
-    def ensure_route() -> dict:
+    def ensure_route(balanced: bool = False) -> dict:
+        """The service's static route. A service that keeps running needs it load-balanced: the platform restarts and
+        releases it under the same task, and only a load-balanced route takes it back."""
         found = route_by_name(route)
+        if found and balanced and not (found.get("load_balancer") or {}).get("enabled"):
+            # a route from an earlier run: an active route is changed only while disabled
+            call("routers.set_route_enabled", {"id": found["id"], "enabled": False, "force": True})
+            call("routers.add_or_update_route", {
+                "id": found["id"], "name": found["name"], "type": found["type"], "path": found["path"].strip("/"),
+                "auth_enabled": found.get("auth_enabled", True), "load_balancer": {"enabled": True}, "enabled": False,
+                "user_groups": [g["id"] if isinstance(g, dict) else g for g in found.get("user_groups") or []]})
+            call("routers.set_route_enabled", {"id": found["id"], "enabled": True})
+            say(f"route {route} is now load-balanced")
+            return route_by_name(route)
         if found:
             return found
         body = {"name": route, "type": "path", "path": path.strip("/"), "auth_enabled": True,
-                "load_balancer": {"enabled": False}, "enabled": True}
+                "load_balancer": {"enabled": balanced}, "enabled": True}
         if open_to:
             groups = [g["id"] for g in call("permissions.get_user_groups", {}).get("groups", [])
                       if g.get("name") == open_to]
@@ -110,8 +122,14 @@ def service(pipeline: str, name: str, app: str, launch: str, route: str, path: s
                        "entry_point": t["entry_point"], "working_dir": t.get("working_dir", "."), "binary": "python3",
                        "requirements": {"pip": t.get("requirements", "")}},
             "container": {"image": t.get("image", "python:3.11-slim")},
-            "hyperparams": {"Environment": {k: {"section": "Environment", "name": k, "value": v}
-                                            for k, v in t["environment"].items()}},
+            "hyperparams": {
+                "Environment": {k: {"section": "Environment", "name": k, "value": v} for k, v in t["environment"].items()},
+                # Keep running: the platform runs it as a service, restarted when it fails, health checked on its
+                # health path, released by revision
+                **({"Service": {k: {"section": "Service", "name": k, "value": v} for k, v in {
+                    "run_mode": "keep_running", "port": str(t.get("port", 8080)), "health_path": health}.items()}}
+                   if t.get("keep_running") else {}),
+            },
         })["id"]
         call("tasks.enqueue", {"task": created, "queue_name": t["queue"]})
         return created
@@ -150,7 +168,7 @@ def service(pipeline: str, name: str, app: str, launch: str, route: str, path: s
     spec = hashlib.sha256(json.dumps({"app": app, "launch": settings, "route": route, "path": path,
                                       "open_to": open_to}, sort_keys=True).encode()).hexdigest()[:12]
 
-    the_route = ensure_route()
+    the_route = ensure_route(balanced=app == "task" and bool(settings.get("keep_running")))
     same = [t for t in running if f"spec:{spec}" in (t.get("system_tags") or [])]
     older = [t for t in running if t not in same]
 

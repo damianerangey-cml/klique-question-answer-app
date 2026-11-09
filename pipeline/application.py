@@ -16,7 +16,9 @@ from step to step as step outputs, so no service needs another's address written
 
 answer-service is the team's own code, so it runs as a task straight from this repository, by default at the commit
 the pipeline itself runs: one commit describes the whole app, and the service's task page shows its repository,
-branch and commit. The models and the vector store are public images, run by their catalogue apps.
+branch and commit. It keeps running: the platform restarts it when it fails, checks /health, and releases a new
+commit or settings as a new revision under the same task. The models and the vector store are public images, run by
+their catalogue apps.
 
 What can be changed from the pipeline's parameters, without touching the code:
   answer_service_commit  the commit answer-service runs (empty: the pipeline's own commit)
@@ -136,7 +138,7 @@ if __name__ == "__main__":
                  launch=json.dumps({
                      "name": "answer-service", "project": PROJECT, "queue": QUEUE, "image": "python:3.11-slim",
                      "repository": repository, "branch": branch, "commit": "${pipeline.answer_service_commit}",
-                     "entry_point": "serve.py", "working_dir": "answer-service", "port": 8080,
+                     "entry_point": "serve.py", "working_dir": "answer-service", "port": 8080, "keep_running": True,
                      "default_commit": own_commit, "requirements": requirements.strip() + "\nclearml"}),
                  env="\n".join([f"CHAT_URL={address('chat_model')}/chat",
                                 f"EMBED_URL={address('embed_model')}/embed",
