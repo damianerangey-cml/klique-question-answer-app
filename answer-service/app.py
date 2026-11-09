@@ -33,7 +33,7 @@ def chat_page():
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "version": "2026-11-09.1"}
 
 
 @app.post("/ask")
